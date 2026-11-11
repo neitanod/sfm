@@ -23,9 +23,41 @@ const STYLE_SELECTED: &str = "\x1b[7m";
 const STYLE_DIM: &str = "\x1b[90m";
 const STYLE_HEADER: &str = "\x1b[1;32m";
 const STYLE_ERROR: &str = "\x1b[31m";
+const STYLE_PROMPT: &str = "\x1b[1;33m";
+const STYLE_OK: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 
-const HELP: &str = "←↑↓→ move  . hidden  r reload  q quit";
+const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  . hidden  q quit";
+const HELP_SHORT: &str = "c p m e . q";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Copy,
+    Move,
+}
+
+impl Op {
+    fn verb(self) -> &'static str {
+        match self {
+            Op::Copy => "copy",
+            Op::Move => "move",
+        }
+    }
+}
+
+/// Operación esperando la confirmación y/N.
+#[derive(Debug)]
+struct Pending {
+    op: Op,
+    src: PathBuf,
+    dest: PathBuf,
+}
+
+/// Mensaje de la barra de abajo.
+enum Notice {
+    Info(String),
+    Error(String),
+}
 
 struct App {
     cwd: PathBuf,
@@ -36,7 +68,12 @@ struct App {
     show_hidden: bool,
     /// Último elemento elegido en cada carpeta visitada.
     remembered: HashMap<PathBuf, OsString>,
-    message: Option<String>,
+    message: Option<Notice>,
+    /// Lo que se marcó con C, para pegar con P o mover con M.
+    clipboard: Option<PathBuf>,
+    pending: Option<Pending>,
+    /// Archivo a abrir en el editor; lo atiende el loop, que maneja la terminal.
+    edit_request: Option<PathBuf>,
     preview_cache: Option<(PathBuf, usize, bool, Preview)>,
     quit: bool,
 }
@@ -52,6 +89,9 @@ impl App {
             show_hidden: false,
             remembered: HashMap::new(),
             message: None,
+            clipboard: None,
+            pending: None,
+            edit_request: None,
             preview_cache: None,
             quit: false,
         };
@@ -92,7 +132,7 @@ impl App {
         let entries = match listing::read_dir(&dir, self.show_hidden, false) {
             Ok(e) => e,
             Err(e) => {
-                self.message = Some(format!("{}: {e}", dir.display()));
+                self.message = Some(Notice::Error(format!("{}: {e}", dir.display())));
                 return;
             }
         };
@@ -138,8 +178,69 @@ impl App {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
     }
 
+    fn mark(&mut self) {
+        if let (Some(path), Some(e)) = (self.selected_path(), self.selected()) {
+            self.message = Some(Notice::Info(format!(
+                "marked {} — p pastes a copy here, m moves it here",
+                e.display
+            )));
+            self.clipboard = Some(path);
+        }
+    }
+
+    /// Prepara la copia o el movimiento de lo marcado a la carpeta actual y
+    /// pide confirmación. Nunca pisa algo que ya existe.
+    fn request(&mut self, op: Op) {
+        let Some(src) = self.clipboard.clone() else {
+            self.message = Some(Notice::Error(
+                "nothing marked: press c on a file or folder first".into(),
+            ));
+            return;
+        };
+        match check_transfer(&src, &self.cwd) {
+            Ok(dest) => self.pending = Some(Pending { op, src, dest }),
+            Err(e) => self.message = Some(Notice::Error(e)),
+        }
+    }
+
+    fn confirm(&mut self, p: Pending) {
+        let name = p.dest.file_name().map(|n| n.to_os_string());
+        match run_transfer(&p) {
+            Ok(()) => {
+                if p.op == Op::Move {
+                    self.clipboard = None;
+                }
+                self.preview_cache = None;
+                self.change_dir(self.cwd.clone(), name);
+                self.message = Some(Notice::Info(format!(
+                    "{} done: {}",
+                    p.op.verb(),
+                    p.dest.display()
+                )));
+            }
+            Err(e) => self.message = Some(Notice::Error(e)),
+        }
+    }
+
+    fn edit(&mut self) {
+        let Some(path) = self.selected_path() else { return };
+        if path.is_dir() {
+            self.message = Some(Notice::Error("e edits files, not folders".into()));
+        } else {
+            self.edit_request = Some(path);
+        }
+    }
+
     fn handle(&mut self, key: Key, page: usize) {
         self.message = None;
+        if let Some(p) = self.pending.take() {
+            if matches!(key, Key::Char('y') | Key::Char('Y')) {
+                self.confirm(p);
+            } else {
+                self.message = Some(Notice::Info(format!("{} cancelled", p.op.verb())));
+            }
+            return;
+        }
         let page = page.max(1) as isize;
         match key {
             Key::Up | Key::Char('k') => self.move_cursor(-1),
@@ -155,6 +256,10 @@ impl App {
                 self.reload();
             }
             Key::Char('r') | Key::Ctrl(b'l') => self.reload(),
+            Key::Char('c') | Key::Char('C') => self.mark(),
+            Key::Char('p') | Key::Char('P') => self.request(Op::Copy),
+            Key::Char('m') | Key::Char('M') => self.request(Op::Move),
+            Key::Char('e') | Key::Char('E') => self.edit(),
             Key::Char('q') | Key::Esc | Key::Ctrl(b'c') => self.quit = true,
             _ => {}
         }
@@ -309,8 +414,21 @@ impl App {
     }
 
     fn status_line(&self, cols: usize) -> String {
-        if let Some(msg) = &self.message {
-            return format!("{STYLE_ERROR}{}{RESET}", fit(&text::sanitize(&format!(" {msg}")), cols));
+        if let Some(p) = &self.pending {
+            let q = format!(
+                " {} {} → {}/ ? [y/N]",
+                p.op.verb(),
+                p.src.display(),
+                self.cwd.display()
+            );
+            return format!("{STYLE_PROMPT}{}{RESET}", fit(&text::sanitize(&q), cols));
+        }
+        if let Some(n) = &self.message {
+            let (style, msg) = match n {
+                Notice::Info(m) => (STYLE_OK, m),
+                Notice::Error(m) => (STYLE_ERROR, m),
+            };
+            return format!("{style}{}{RESET}", fit(&text::sanitize(&format!(" {msg}")), cols));
         }
         let mut info = String::new();
         if !self.entries.is_empty() {
@@ -332,17 +450,87 @@ impl App {
         if self.show_hidden {
             info.push_str("  [hidden]");
         }
-        let info = text::sanitize(&info);
-        let help_w = HELP.chars().count() + 1;
-        if cols > help_w + 10 {
-            format!(
-                "{}{STYLE_DIM}{HELP} {RESET}",
-                fit(&info, cols - help_w)
-            )
-        } else {
-            fit(&info, cols)
+        if let Some(c) = &self.clipboard {
+            let name = c.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            let _ = write!(info, "  [marked: {name}]");
         }
+        let info = text::sanitize(&info);
+        // La ayuda larga si entra, si no la corta, si no ninguna.
+        let info_w = info.chars().map(text::char_width).sum::<usize>();
+        for help in [HELP, HELP_SHORT] {
+            let help_w = help.chars().count() + 1;
+            if cols >= help_w + info_w.max(10) {
+                return format!("{}{STYLE_DIM}{help} {RESET}", fit(&info, cols - help_w));
+            }
+        }
+        fit(&info, cols)
     }
+}
+
+/// Valida copiar o mover `src` adentro de `dir` y devuelve el destino.
+fn check_transfer(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(src).is_err() {
+        return Err(format!("{} no longer exists", src.display()));
+    }
+    let name = src
+        .file_name()
+        .ok_or_else(|| format!("can't use {}", src.display()))?;
+    let dest = dir.join(name);
+    if dir.starts_with(src) {
+        return Err("can't put a folder inside itself".into());
+    }
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        return Err(format!(
+            "{} already exists here, not overwriting",
+            name.to_string_lossy()
+        ));
+    }
+    Ok(dest)
+}
+
+/// Corre `cp -a` o `mv` y devuelve el error de la herramienta si falla.
+fn run_transfer(p: &Pending) -> Result<(), String> {
+    let mut cmd = match p.op {
+        Op::Copy => {
+            let mut c = std::process::Command::new("cp");
+            c.arg("-a");
+            c
+        }
+        Op::Move => std::process::Command::new("mv"),
+    };
+    // -n además del chequeo previo: si algo apareció en el medio, no se pisa.
+    let out = cmd
+        .arg("-n")
+        .arg("--")
+        .arg(&p.src)
+        .arg(&p.dest)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", p.op.verb()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err.lines().next().unwrap_or("failed").trim();
+        Err(format!("{} failed: {line}", p.op.verb()))
+    }
+}
+
+/// Abre el archivo en $VISUAL, $EDITOR, vim o vi, en ese orden. La variable
+/// puede traer argumentos ("code -w"), por eso pasa por sh.
+fn open_editor(path: &Path) -> std::io::Result<()> {
+    const SCRIPT: &str = r#"ed=${VISUAL:-${EDITOR:-}}
+if [ -z "$ed" ]; then
+  if command -v vim >/dev/null 2>&1; then ed=vim; else ed=vi; fi
+fi
+exec $ed "$1""#;
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("sfm")
+        .arg(path)
+        .status()
+        .map(|_| ())
 }
 
 fn start_dir() -> Result<PathBuf, String> {
@@ -380,6 +568,18 @@ fn run(start: &Path) -> std::io::Result<()> {
         for key in term::read_keys()? {
             app.handle(key, rows.saturating_sub(2));
             dirty = true;
+            if let Some(path) = app.edit_request.take() {
+                term::leave();
+                let result = open_editor(&path);
+                term::resume()?;
+                if let Err(e) = result {
+                    app.message = Some(Notice::Error(format!("editor: {e}")));
+                }
+                app.reload();
+                // El editor pudo cambiar el archivo: recalcular el preview.
+                app.preview_cache = None;
+                break;
+            }
         }
     }
     Ok(())
@@ -471,6 +671,94 @@ mod tests {
         app.cursor = 0;
         app.scroll(2);
         assert_eq!(app.offset, 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn select(app: &mut App, name: &str) {
+        app.cursor = app.entries.iter().position(|e| e.display == name).unwrap();
+    }
+
+    #[test]
+    fn copy_then_move_with_confirmation() {
+        let d = tree("transfer");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('C'), 10);
+        select(&mut app, "beta");
+        app.handle(Key::Right, 10);
+
+        // Cualquier tecla que no sea y cancela
+        app.handle(Key::Char('P'), 10);
+        assert!(app.pending.is_some());
+        app.handle(Key::Char('n'), 10);
+        assert!(!d.join("beta/zfile.txt").exists());
+
+        app.handle(Key::Char('P'), 10);
+        app.handle(Key::Char('y'), 10);
+        assert_eq!(fs::read_to_string(d.join("beta/zfile.txt")).unwrap(), "hello\n");
+        assert!(d.join("zfile.txt").exists());
+        assert_eq!(app.selected().unwrap().display, "zfile.txt");
+
+        // Pegar otra vez en el mismo lugar no pisa
+        app.handle(Key::Char('P'), 10);
+        assert!(app.pending.is_none());
+        assert!(matches!(app.message, Some(Notice::Error(_))));
+
+        // Mover a alpha
+        app.handle(Key::Left, 10);
+        select(&mut app, "alpha");
+        app.handle(Key::Right, 10);
+        app.handle(Key::Char('M'), 10);
+        app.handle(Key::Char('y'), 10);
+        assert!(d.join("alpha/zfile.txt").exists());
+        assert!(!d.join("zfile.txt").exists());
+        assert!(app.clipboard.is_none());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn folder_cannot_go_inside_itself() {
+        let d = tree("itself");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "alpha");
+        app.handle(Key::Char('c'), 10);
+        app.handle(Key::Right, 10);
+        select(&mut app, "inner");
+        app.handle(Key::Right, 10);
+        app.handle(Key::Char('m'), 10);
+        assert!(app.pending.is_none());
+        assert!(d.join("alpha/inner").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn copy_folder_recursively() {
+        let d = tree("copydir");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "alpha");
+        app.handle(Key::Char('c'), 10);
+        app.handle(Key::Right, 10);
+        select(&mut app, "inner");
+        app.handle(Key::Left, 10);
+        select(&mut app, "beta");
+        app.handle(Key::Right, 10);
+        app.handle(Key::Char('p'), 10);
+        app.handle(Key::Char('y'), 10);
+        assert!(d.join("beta/alpha/notes.txt").exists());
+        assert!(d.join("beta/alpha/inner").is_dir());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn edit_requests_only_files() {
+        let d = tree("edit");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "alpha");
+        app.handle(Key::Char('e'), 10);
+        assert!(app.edit_request.is_none());
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('E'), 10);
+        assert_eq!(app.edit_request, Some(d.join("zfile.txt")));
         fs::remove_dir_all(&d).unwrap();
     }
 }

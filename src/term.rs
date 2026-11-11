@@ -66,6 +66,8 @@ const VMIN: usize = 6;
 
 /// Estado original de la terminal, para restaurarlo al salir o en un panic.
 static ORIGINAL: OnceLock<Termios> = OnceLock::new();
+/// Estado crudo, para volver a él después de abrir el editor.
+static RAW: OnceLock<Termios> = OnceLock::new();
 
 const ENTER_SCREEN: &str = "\x1b[?1049h\x1b[?25l\x1b[2J";
 const LEAVE_SCREEN: &str = "\x1b[0m\x1b[?25h\x1b[?1049l";
@@ -76,7 +78,7 @@ pub fn enter() -> io::Result<()> {
     if unsafe { tcgetattr(STDIN, &mut t) } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            "stdin no es una terminal",
+            "stdin is not a terminal",
         ));
     }
     let _ = ORIGINAL.set(t);
@@ -90,16 +92,23 @@ pub fn enter() -> io::Result<()> {
     // cambio de tamaño de la ventana sin manejar señales.
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 2;
-    if unsafe { tcsetattr(STDIN, TCSAFLUSH, &raw) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let _ = RAW.set(raw);
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         leave();
         prev(info);
     }));
+    resume()
+}
 
+/// Vuelve al modo crudo y a la pantalla alternativa (después de `leave`).
+pub fn resume() -> io::Result<()> {
+    if let Some(raw) = RAW.get() {
+        if unsafe { tcsetattr(STDIN, TCSAFLUSH, raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     let mut out = io::stdout();
     out.write_all(ENTER_SCREEN.as_bytes())?;
     out.flush()
