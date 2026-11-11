@@ -71,6 +71,11 @@ same entry. If the current folder is deleted or moved, `sfm` climbs to the
 nearest folder that still exists. Bursts of changes are applied at most ten
 times per second, and an idle `sfm` uses no CPU.
 
+inotify is part of the Linux kernel and is compiled into the static binary.
+When it isn't usable (instance or watch limits reached, a kernel built without
+it, or network filesystems that don't report remote changes), `sfm` silently
+keeps working without live refresh, and `r` reloads by hand.
+
 ## Install
 
 Download the static binary from the

@@ -74,6 +74,12 @@ se queda sobre la misma entrada. Si la carpeta actual se borra o se mueve,
 `sfm` sube a la primera carpeta que siga existiendo. Las ráfagas de cambios se
 aplican como mucho diez veces por segundo, y quieto `sfm` usa 0% de CPU.
 
+inotify es parte del kernel de Linux y va compilado dentro del binario
+estático. Cuando no se puede usar (se llegó al límite de instancias o de
+carpetas vigiladas, el kernel no lo trae, o es un sistema de archivos de red
+que no avisa los cambios hechos desde otra máquina), `sfm` sigue andando en
+silencio sin actualización en vivo, y `r` recarga a mano.
+
 ## Instalación
 
 Bajá el binario estático de la
