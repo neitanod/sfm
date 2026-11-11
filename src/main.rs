@@ -17,7 +17,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use term::Key;
+use term::{Key, MouseKind};
 use text::fit;
 
 const STYLE_DIR: &str = "\x1b[1;34m";
@@ -64,6 +64,29 @@ struct Pending {
     dest: PathBuf,
 }
 
+/// Anchos de las columnas y alto de los paneles del último cuadro.
+#[derive(Debug, Default, Clone, Copy)]
+struct Layout {
+    left: usize,
+    center: usize,
+    right: usize,
+    height: usize,
+}
+
+/// Columna de la pantalla en la que cayó un click.
+#[derive(Debug, PartialEq, Eq)]
+enum Area {
+    Left(usize),
+    Center(usize),
+    Right(usize),
+    Outside,
+}
+
+/// Dos clicks en la misma fila dentro de este lapso son un doble click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Filas que mueve cada paso de la rueda.
+const WHEEL_STEP: isize = 3;
+
 /// Mensaje de la barra de abajo.
 enum Notice {
     Info(String),
@@ -88,6 +111,10 @@ struct App {
     /// Dónde van los backups de B: ~/sfm_backups.
     backup_dir: Option<PathBuf>,
     preview_cache: Option<(PathBuf, usize, bool, Preview)>,
+    /// Geometría del último cuadro dibujado, para ubicar los clicks.
+    layout: Layout,
+    /// Último click, para reconocer el doble click.
+    last_click: Option<(Instant, usize, usize)>,
     quit: bool,
 }
 
@@ -107,6 +134,8 @@ impl App {
             edit_request: None,
             backup_dir: std::env::var_os("HOME").map(|h| PathBuf::from(h).join(BACKUP_DIR)),
             preview_cache: None,
+            layout: Layout::default(),
+            last_click: None,
             quit: false,
         };
         app.entries = listing::read_dir(&start, false, false)?;
@@ -399,7 +428,93 @@ impl App {
         }
     }
 
+    /// En qué columna y en qué fila de los paneles (desde 0) cayó un click.
+    fn area_at(&self, col: usize, row: usize) -> Area {
+        let l = self.layout;
+        if row < 2 || row > l.height + 1 || col == 0 {
+            return Area::Outside;
+        }
+        let r = row - 2;
+        let center_start = if l.left > 0 { l.left + 2 } else { 1 };
+        let right_start = center_start + l.center + 1;
+        if l.left > 0 && col <= l.left {
+            Area::Left(r)
+        } else if col >= center_start && col < center_start + l.center {
+            Area::Center(r)
+        } else if l.right > 0 && col >= right_start && col < right_start + l.right {
+            Area::Right(r)
+        } else {
+            Area::Outside
+        }
+    }
+
+    fn click_at(&mut self, col: usize, row: usize, now: Instant) {
+        let double = self.last_click.is_some_and(|(t, c, r)| {
+            now.duration_since(t) < DOUBLE_CLICK
+                && r == row
+                && self.area_at(c, r) == self.area_at(col, row)
+        });
+        // Tras un doble click, el tercero arranca de cero.
+        self.last_click = if double { None } else { Some((now, col, row)) };
+        match self.area_at(col, row) {
+            Area::Center(r) => {
+                let i = self.offset + r;
+                if i < self.entries.len() {
+                    self.cursor = i;
+                    if double {
+                        self.go_into();
+                    }
+                }
+            }
+            Area::Left(r) => {
+                let (start, _) = self.parent_window(self.layout.height);
+                let target = self.parent.get(start + r).map(|e| e.name.clone());
+                if let (Some(name), Some(parent)) = (target, self.cwd.parent()) {
+                    if Some(name.as_os_str()) != self.cwd.file_name() {
+                        let dir = parent.join(name);
+                        self.change_dir(dir, None);
+                    }
+                }
+            }
+            Area::Right(r) => {
+                let name = match &self.preview_cache {
+                    Some((_, _, _, Preview::Dir { entries, more })) => {
+                        let shown = if *more && entries.len() >= self.layout.height {
+                            self.layout.height.saturating_sub(1)
+                        } else {
+                            entries.len()
+                        };
+                        (r < shown).then(|| entries[r].name.clone())
+                    }
+                    _ => None,
+                };
+                if let (Some(name), Some(dir)) = (name, self.selected_path()) {
+                    self.change_dir(dir, Some(name));
+                }
+            }
+            Area::Outside => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, kind: MouseKind, col: usize, row: usize) {
+        match kind {
+            MouseKind::LeftPress => self.click_at(col, row, Instant::now()),
+            MouseKind::WheelUp => self.move_cursor(-WHEEL_STEP),
+            MouseKind::WheelDown => self.move_cursor(WHEEL_STEP),
+            MouseKind::Other => {}
+        }
+    }
+
     fn handle(&mut self, key: Key, page: usize) {
+        if let Key::Mouse { kind, col, row } = key {
+            // Con una confirmación en pantalla, el mouse no hace nada: así
+            // un movimiento de la rueda no la cancela.
+            if self.pending.is_none() && kind != MouseKind::Other {
+                self.message = None;
+                self.handle_mouse(kind, col, row);
+            }
+            return;
+        }
         self.message = None;
         if let Some(p) = self.pending.take() {
             // Borrar exige la Y mayúscula; lo demás acepta y o Y.
@@ -476,6 +591,12 @@ impl App {
             cols
         };
         self.scroll(height);
+        self.layout = Layout {
+            left: left_w,
+            center: center_w,
+            right: right_w,
+            height,
+        };
 
         let left = self.left_column(height, left_w);
         let center = self.center_column(height, center_w);
@@ -530,18 +651,24 @@ impl App {
         format!("{mark}{style}{sel}{}{RESET}", fit(&name, width - 1))
     }
 
-    fn left_column(&self, height: usize, width: usize) -> Vec<String> {
+    /// Primera fila visible de la columna izquierda y posición de la carpeta
+    /// actual en ella. La carpeta actual queda centrada.
+    fn parent_window(&self, height: usize) -> (usize, Option<usize>) {
         let current = self.cwd.file_name();
-        let parent_dir = self.cwd.parent();
         let idx = self
             .parent
             .iter()
             .position(|e| Some(e.name.as_os_str()) == current);
-        // Centrar la carpeta actual en la columna.
         let start = idx
             .unwrap_or(0)
             .saturating_sub(height / 2)
             .min(self.parent.len().saturating_sub(height));
+        (start, idx)
+    }
+
+    fn left_column(&self, height: usize, width: usize) -> Vec<String> {
+        let parent_dir = self.cwd.parent();
+        let (start, idx) = self.parent_window(height);
         (0..height)
             .map(|row| match self.parent.get(start + row) {
                 Some(e) => Self::entry_cell(
@@ -1205,6 +1332,75 @@ mod tests {
         assert_eq!(preview, Some(d.join("alpha/inner")));
         select(&mut app, "notes.txt");
         assert_eq!(app.watch_paths().2, None);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Dibuja un cuadro de 100x12: izquierda 18 columnas, centro de la 20 a
+    /// la 63, derecha desde la 65. Los paneles van de la fila 2 a la 11.
+    fn drawn(dir: PathBuf) -> App {
+        let mut app = App::new(dir).unwrap();
+        app.render(12, 100);
+        app
+    }
+
+    #[test]
+    fn click_moves_cursor_and_double_click_enters() {
+        let d = tree("click");
+        let mut app = drawn(d.clone());
+        let t0 = Instant::now();
+        // Fila 3 de la pantalla = segunda entrada (beta)
+        app.click_at(30, 3, t0);
+        assert_eq!(app.selected().unwrap().display, "beta");
+        assert_eq!(app.cwd, d);
+        app.click_at(30, 2, t0 + Duration::from_millis(500)); // lento: no es doble
+        assert_eq!(app.cwd, d);
+        app.click_at(30, 2, t0 + Duration::from_millis(600));
+        assert_eq!(app.cwd, d.join("alpha"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn double_click_on_file_only_selects() {
+        let d = tree("dblfile");
+        let mut app = drawn(d.clone());
+        let t0 = Instant::now();
+        app.click_at(30, 4, t0);
+        app.click_at(30, 4, t0 + Duration::from_millis(100));
+        assert_eq!(app.cwd, d);
+        assert_eq!(app.selected().unwrap().display, "zfile.txt");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn click_on_left_column_goes_to_that_folder() {
+        let d = tree("leftclick");
+        let mut app = drawn(d.join("alpha"));
+        // Columna izquierda: alpha/ en la fila 2, beta/ en la 3
+        app.click_at(5, 3, Instant::now());
+        assert_eq!(app.cwd, d.join("beta"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn click_on_preview_enters_with_that_entry() {
+        let d = tree("rightclick");
+        let mut app = drawn(d.clone()); // alpha seleccionada; preview: inner/, notes.txt
+        app.click_at(70, 3, Instant::now());
+        assert_eq!(app.cwd, d.join("alpha"));
+        assert_eq!(app.selected().unwrap().display, "notes.txt");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn wheel_moves_and_mouse_keeps_confirmation() {
+        let d = tree("wheel");
+        let mut app = drawn(d.clone());
+        app.handle(Key::Mouse { kind: MouseKind::WheelDown, col: 30, row: 3 }, 10);
+        assert_eq!(app.cursor, 2);
+        app.handle(Key::Char('D'), 10);
+        app.handle(Key::Mouse { kind: MouseKind::WheelUp, col: 30, row: 3 }, 10);
+        assert!(app.pending.is_some());
+        assert_eq!(app.cursor, 2);
         fs::remove_dir_all(&d).unwrap();
     }
 }

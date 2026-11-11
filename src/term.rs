@@ -79,8 +79,10 @@ static ORIGINAL: OnceLock<Termios> = OnceLock::new();
 /// Estado crudo, para volver a él después de abrir el editor.
 static RAW: OnceLock<Termios> = OnceLock::new();
 
-const ENTER_SCREEN: &str = "\x1b[?1049h\x1b[?25l\x1b[2J";
-const LEAVE_SCREEN: &str = "\x1b[0m\x1b[?25h\x1b[?1049l";
+// 1000: avisos de clicks y rueda del mouse; 1006: en formato SGR, que
+// admite cualquier tamaño de terminal.
+const ENTER_SCREEN: &str = "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[?1000h\x1b[?1006h";
+const LEAVE_SCREEN: &str = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 /// Pasa la terminal a modo crudo y a la pantalla alternativa.
 pub fn enter() -> io::Result<()> {
@@ -145,6 +147,15 @@ pub fn size() -> (usize, usize) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    LeftPress,
+    WheelUp,
+    WheelDown,
+    /// Otros botones, soltar o arrastrar: se ignoran.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Up,
     Down,
@@ -157,6 +168,12 @@ pub enum Key {
     Enter,
     Esc,
     Ctrl(u8),
+    /// Evento de mouse; columna y fila empiezan en 1.
+    Mouse {
+        kind: MouseKind,
+        col: usize,
+        row: usize,
+    },
     Char(char),
 }
 
@@ -270,6 +287,9 @@ fn parse_escape(s: &[u8]) -> (Key, usize) {
                 return (Key::Esc, s.len());
             }
             let params = &s[2..j];
+            if params.first() == Some(&b'<') {
+                return (parse_sgr_mouse(&params[1..], s[j]), j + 1);
+            }
             let key = match s[j] {
                 b'A' => Key::Up,
                 b'B' => Key::Down,
@@ -293,9 +313,51 @@ fn parse_escape(s: &[u8]) -> (Key, usize) {
     }
 }
 
+/// Mouse en formato SGR: ESC [ < botón ; columna ; fila (M al apretar, m al soltar).
+fn parse_sgr_mouse(params: &[u8], fin: u8) -> Key {
+    let nums: Vec<usize> = std::str::from_utf8(params)
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [button, col, row] = nums[..] else {
+        return Key::Mouse {
+            kind: MouseKind::Other,
+            col: 0,
+            row: 0,
+        };
+    };
+    // Bits 4, 8 y 16 son Shift, Alt y Ctrl; 32 es arrastre; 64 es la rueda.
+    let kind = match (button & !0b11100, fin) {
+        (0, b'M') => MouseKind::LeftPress,
+        (64, b'M') => MouseKind::WheelUp,
+        (65, b'M') => MouseKind::WheelDown,
+        _ => MouseKind::Other,
+    };
+    Key::Mouse { kind, col, row }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sgr_mouse_events() {
+        assert_eq!(
+            parse_keys(b"\x1b[<0;12;5M\x1b[<0;12;5m\x1b[<65;3;4M\x1b[<64;3;4M"),
+            vec![
+                Key::Mouse { kind: MouseKind::LeftPress, col: 12, row: 5 },
+                Key::Mouse { kind: MouseKind::Other, col: 12, row: 5 },
+                Key::Mouse { kind: MouseKind::WheelDown, col: 3, row: 4 },
+                Key::Mouse { kind: MouseKind::WheelUp, col: 3, row: 4 },
+            ]
+        );
+        // Arrastre con el botón apretado: se ignora
+        assert_eq!(
+            parse_keys(b"\x1b[<32;1;1M"),
+            vec![Key::Mouse { kind: MouseKind::Other, col: 1, row: 1 }]
+        );
+    }
 
     #[test]
     fn arrows_in_both_modes() {

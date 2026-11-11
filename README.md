@@ -50,6 +50,27 @@ inside itself.
 backup of the same entry within the same minute gets a `-2` suffix instead of
 replacing the first one. `D` refuses folders that still have something inside.
 
+## Mouse
+
+| Action | Effect |
+|---|---|
+| Click a row in the center column | Move the cursor there |
+| Double-click a folder in the center column | Enter it |
+| Click a folder in the left column | Go to that folder |
+| Click an entry in the preview | Enter the previewed folder with that entry selected |
+| Wheel | Move the cursor three rows |
+
+While the mouse is captured, hold Shift to select text on screen, as in vim or htop.
+
+## Live refresh
+
+`sfm` watches the folders on screen (current, parent and previewed) with
+inotify and redraws as soon as something changes: new, deleted or renamed
+entries, and the content of the file under the cursor. The cursor stays on the
+same entry. If the current folder is deleted or moved, `sfm` climbs to the
+nearest folder that still exists. Bursts of changes are applied at most ten
+times per second, and an idle `sfm` uses no CPU.
+
 ## Install
 
 Download the static binary from the

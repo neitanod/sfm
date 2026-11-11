@@ -52,6 +52,28 @@ nada. Un segundo backup de lo mismo dentro del mismo minuto lleva `-2` al final
 en vez de pisar al primero. `D` rechaza las carpetas que todavía tienen algo
 adentro.
 
+## Mouse
+
+| Acción | Efecto |
+|---|---|
+| Click en una fila de la columna central | Mueve el cursor ahí |
+| Doble click en una carpeta de la columna central | Entra a esa carpeta |
+| Click en una carpeta de la columna izquierda | Va a esa carpeta |
+| Click en una entrada del preview | Entra a la carpeta del preview con esa entrada elegida |
+| Rueda | Mueve el cursor de a tres filas |
+
+Con el mouse capturado, para seleccionar texto de la pantalla hay que mantener
+Shift, como en vim o htop.
+
+## Actualización en vivo
+
+`sfm` vigila con inotify las carpetas que están en pantalla (la actual, la
+padre y la del preview) y se redibuja apenas algo cambia: entradas nuevas,
+borradas o renombradas, y el contenido del archivo bajo el cursor. El cursor
+se queda sobre la misma entrada. Si la carpeta actual se borra o se mueve,
+`sfm` sube a la primera carpeta que siga existiendo. Las ráfagas de cambios se
+aplican como mucho diez veces por segundo, y quieto `sfm` usa 0% de CPU.
+
 ## Instalación
 
 Bajá el binario estático de la
