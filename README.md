@@ -1,9 +1,11 @@
-# sfm
+# Simple File Manager
 
 [Leer en castellano](README.es.md)
 
-A three-column terminal file manager written in Rust with **zero dependencies**:
-only the standard library. It ships as a single static binary you can copy to
+A minimalist file manager with no dependencies, built for my own use.
+
+`sfm` is a three-column terminal file manager written in Rust using only the
+standard library. It ships as a single static binary you can copy to
 any x86_64 Linux machine and run.
 
 ```
