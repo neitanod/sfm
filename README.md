@@ -101,7 +101,19 @@ cargo build --release --target x86_64-unknown-linux-musl  # fully static
 ```sh
 sfm            # start in the current directory
 sfm /var/log   # start somewhere else
+sfm -d         # on quit, print `cd <folder you were in>`
 ```
+
+With `-d` and a shell function, the shell follows you to the folder you quit
+from. Add this to `~/.bashrc` or `~/.zshrc`:
+
+```sh
+s() { eval "$(sfm -d "$@")"; }
+```
+
+When stdout is a pipe, as inside `$(...)`, `sfm` draws straight on the terminal
+(`/dev/tty`) and stdout carries only the `cd` line. Paths with spaces or quotes
+come out single-quoted, ready for the shell.
 
 ## Limits
 

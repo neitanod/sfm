@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::os::fd::IntoRawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(not(target_os = "linux"))]
@@ -39,6 +41,7 @@ unsafe extern "C" {
     fn tcsetattr(fd: i32, action: i32, termios: *const Termios) -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn isatty(fd: i32) -> i32;
 }
 
 #[repr(C)]
@@ -78,6 +81,23 @@ const VMIN: usize = 6;
 static ORIGINAL: OnceLock<Termios> = OnceLock::new();
 /// Estado crudo, para volver a él después de abrir el editor.
 static RAW: OnceLock<Termios> = OnceLock::new();
+/// Dónde se dibuja: stdout, o /dev/tty si stdout es un pipe (como en
+/// `eval "$(sfm -d)"`, donde stdout sólo lleva el `cd` final).
+static OUT_FD: AtomicI32 = AtomicI32::new(STDOUT);
+
+/// Escritor sobre el descriptor donde se dibuja. No lo cierra al soltarse.
+pub fn writer() -> ManuallyDrop<File> {
+    ManuallyDrop::new(unsafe { File::from_raw_fd(OUT_FD.load(Ordering::Relaxed)) })
+}
+
+/// Si se dibuja en /dev/tty, una copia para que el editor escriba ahí y no
+/// en el pipe de stdout.
+pub fn tty_stdout() -> Option<std::process::Stdio> {
+    if OUT_FD.load(Ordering::Relaxed) == STDOUT {
+        return None;
+    }
+    writer().try_clone().ok().map(std::process::Stdio::from)
+}
 
 // 1000: avisos de clicks y rueda del mouse; 1006: en formato SGR, que
 // admite cualquier tamaño de terminal.
@@ -94,6 +114,13 @@ pub fn enter() -> io::Result<()> {
         ));
     }
     let _ = ORIGINAL.set(t);
+
+    if unsafe { isatty(STDOUT) } == 0 {
+        // Si no hay /dev/tty se sigue dibujando en stdout.
+        if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            OUT_FD.store(tty.into_raw_fd(), Ordering::Relaxed);
+        }
+    }
 
     let mut raw = t;
     raw.c_iflag &= !(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -120,7 +147,7 @@ pub fn resume() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    let mut out = io::stdout();
+    let mut out = writer();
     out.write_all(ENTER_SCREEN.as_bytes())?;
     out.flush()
 }
@@ -130,7 +157,7 @@ pub fn leave() {
     if let Some(t) = ORIGINAL.get() {
         unsafe { tcsetattr(STDIN, TCSAFLUSH, t) };
     }
-    let mut out = io::stdout();
+    let mut out = writer();
     let _ = out.write_all(LEAVE_SCREEN.as_bytes());
     let _ = out.flush();
 }
@@ -138,7 +165,8 @@ pub fn leave() {
 /// Tamaño de la terminal en (filas, columnas).
 pub fn size() -> (usize, usize) {
     let mut ws = Winsize::default();
-    let ok = unsafe { ioctl(STDOUT, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0;
+    let fd = OUT_FD.load(Ordering::Relaxed);
+    let ok = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0;
     if ok && ws.ws_row > 0 && ws.ws_col > 0 {
         (ws.ws_row as usize, ws.ws_col as usize)
     } else {

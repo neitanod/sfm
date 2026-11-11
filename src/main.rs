@@ -927,23 +927,72 @@ if [ -z "$ed" ]; then
   if command -v vim >/dev/null 2>&1; then ed=vim; else ed=vi; fi
 fi
 exec $ed "$1""#;
-    std::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(SCRIPT)
         .arg("sfm")
-        .arg(path)
-        .status()
-        .map(|_| ())
+        .arg(path);
+    if let Some(tty) = term::tty_stdout() {
+        cmd.stdout(tty);
+    }
+    cmd.status().map(|_| ())
 }
 
-fn start_dir() -> Result<PathBuf, String> {
-    let arg = std::env::args_os().nth(1);
-    if let Some(a) = &arg {
-        if a == "-h" || a == "--help" {
-            println!("usage: sfm [DIR]\n\n{HELP}\nh/j/k/l and Enter also work; PgUp/PgDn/Home/End jump.");
-            std::process::exit(0);
+const USAGE: &str = "usage: sfm [-d] [DIR]
+
+  DIR   folder to open (default: the current folder)
+  -d    on quit, print `cd <folder>` with the folder you were in.
+        With a shell function the shell follows you:
+          s() { eval \"$(sfm -d \"$@\")\"; }
+
+Press H inside sfm for every key.";
+
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    dir: Option<std::ffi::OsString>,
+    print_cd: bool,
+    help: bool,
+}
+
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args, String> {
+    let mut out = Args::default();
+    let mut options = true;
+    for a in args {
+        match a.to_str() {
+            Some("--") if options => options = false,
+            Some("-d") if options => out.print_cd = true,
+            Some("-h" | "--help") if options => out.help = true,
+            Some(o) if options && o.starts_with('-') && o.len() > 1 => {
+                return Err(format!("unknown option {o}\n\n{USAGE}"));
+            }
+            _ if out.dir.is_some() => return Err(format!("only one folder, please\n\n{USAGE}")),
+            _ => out.dir = Some(a),
         }
     }
+    Ok(out)
+}
+
+/// Una ruta lista para pegar en la shell: tal cual si sólo tiene caracteres
+/// seguros, y si no entre comillas simples.
+fn shell_quote(path: &Path) -> Vec<u8> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let safe = |b: &u8| b.is_ascii_alphanumeric() || b"/._-+,:@%".contains(b);
+    if !bytes.is_empty() && bytes.iter().all(safe) {
+        return bytes.to_vec();
+    }
+    let mut out = vec![b'\''];
+    for &b in bytes {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+fn start_dir(arg: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
     let path = match arg {
         Some(a) => PathBuf::from(a),
         None => std::env::current_dir().map_err(|e| format!("current dir: {e}"))?,
@@ -962,12 +1011,13 @@ const REFRESH_EVERY: Duration = Duration::from_millis(100);
 /// Cada cuánto se revisa el tamaño de la ventana si no pasa nada.
 const IDLE_WAIT_MS: i32 = 250;
 
-fn run(start: &Path) -> std::io::Result<()> {
+/// Corre la interfaz y devuelve la carpeta en la que estaba al salir.
+fn run(start: &Path) -> std::io::Result<PathBuf> {
     let mut app = App::new(start.to_path_buf())?;
     let mut watcher = watch::Watcher::new();
     let mut changes = watch::Changes::default();
     let mut last_apply = Instant::now() - REFRESH_EVERY;
-    let mut out = std::io::stdout();
+    let mut out = term::writer();
     let mut last_size = (0, 0);
     let mut dirty = true;
     while !app.quit {
@@ -1019,11 +1069,22 @@ fn run(start: &Path) -> std::io::Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(app.cwd)
 }
 
 fn main() {
-    let start = match start_dir() {
+    let args = match parse_args(std::env::args_os().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sfm: {e}");
+            std::process::exit(2);
+        }
+    };
+    if args.help {
+        println!("{USAGE}");
+        return;
+    }
+    let start = match start_dir(args.dir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("sfm: {e}");
@@ -1036,9 +1097,18 @@ fn main() {
     }
     let result = run(&start);
     term::leave();
-    if let Err(e) = result {
-        eprintln!("sfm: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(cwd) if args.print_cd => {
+            let mut line = b"cd ".to_vec();
+            line.extend(shell_quote(&cwd));
+            line.push(b'\n');
+            let _ = std::io::stdout().write_all(&line);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("sfm: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1460,5 +1530,34 @@ mod tests {
         app.handle(Key::Mouse { kind: MouseKind::LeftPress, col: 1, row: 1 }, 10);
         assert!(app.help.is_none());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn os(v: &[&str]) -> Vec<std::ffi::OsString> {
+        v.iter().map(|s| s.into()).collect()
+    }
+
+    #[test]
+    fn args_parsing() {
+        assert_eq!(parse_args(os(&[])).unwrap(), Args::default());
+        let a = parse_args(os(&["-d", "/tmp"])).unwrap();
+        assert!(a.print_cd);
+        assert_eq!(a.dir, Some("/tmp".into()));
+        let a = parse_args(os(&["/tmp", "-d"])).unwrap();
+        assert!(a.print_cd);
+        assert!(parse_args(os(&["-x"])).is_err());
+        assert!(parse_args(os(&["a", "b"])).is_err());
+        // Después de -- un nombre con guión es una carpeta
+        assert_eq!(parse_args(os(&["--", "-d"])).unwrap().dir, Some("-d".into()));
+        assert!(parse_args(os(&["--help"])).unwrap().help);
+    }
+
+    #[test]
+    fn shell_quoting() {
+        let q = |p: &str| String::from_utf8(shell_quote(Path::new(p))).unwrap();
+        assert_eq!(q("/home/sebas/doc"), "/home/sebas/doc");
+        assert_eq!(q("/tmp/con espacio"), "'/tmp/con espacio'");
+        assert_eq!(q("/tmp/it's"), "'/tmp/it'\\''s'");
+        assert_eq!(q("/tmp/$HOME"), "'/tmp/$HOME'");
+        assert_eq!(q("/tmp/ñandú"), "'/tmp/ñandú'");
     }
 }

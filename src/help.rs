@@ -29,6 +29,8 @@ const LINES: &[Line] = &[
     Blank,
     Section("START"),
     Key("sfm [DIR]", "open DIR, or the current folder"),
+    Key("sfm -d [DIR]", "on quit, print cd <folder you were in>"),
+    Note("With s() { eval \"$(sfm -d \"$@\")\"; } in your shell rc, s opens sfm and leaves the shell in the folder you quit from."),
     Note("Left: folders of the parent folder. Center: the current folder, with the cursor. Right: a preview of the entry under the cursor."),
     Blank,
     Section("NAVIGATION"),

@@ -105,7 +105,20 @@ cargo build --release --target x86_64-unknown-linux-musl  # totalmente estático
 ```sh
 sfm            # arranca en la carpeta actual
 sfm /var/log   # arranca en otra
+sfm -d         # al salir, imprime `cd <carpeta donde estabas>`
 ```
+
+Con `-d` y una función de shell, la shell queda en la carpeta desde la que
+saliste. Agregá esto a `~/.bashrc` o `~/.zshrc`:
+
+```sh
+s() { eval "$(sfm -d "$@")"; }
+```
+
+Cuando la salida estándar es un pipe, como adentro de `$(...)`, `sfm` dibuja
+directo en la terminal (`/dev/tty`) y por la salida estándar sale sólo la
+línea del `cd`. Las rutas con espacios o comillas salen entre comillas simples,
+listas para la shell.
 
 ## Límites
 
