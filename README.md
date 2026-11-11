@@ -19,6 +19,8 @@ any x86_64 Linux machine and run.
 
 - **Left:** the folders in the parent directory, with the current one highlighted.
 - **Center:** the current directory. The cursor lives here.
+- Symlinks are cyan and show `name -> target` on their own row in every
+  column; a broken symlink is red.
 - **Right:** a preview of the entry under the cursor. A folder shows its first
   entries (it stops reading after one screenful, so a folder with a million
   files costs the same as one with ten). A text file shows its first lines.

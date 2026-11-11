@@ -13,25 +13,37 @@ pub struct Entry {
     /// Es carpeta, o un symlink que apunta a una carpeta.
     pub is_dir: bool,
     pub is_link: bool,
+    /// A dónde apunta el symlink, listo para mostrar.
+    pub link_target: Option<String>,
+    /// Symlink que apunta a algo que no existe.
+    pub broken: bool,
 }
 
 /// Arma una entrada usando el tipo que ya trae `readdir` (d_type), sin hacer
-/// stat. Solo los symlinks cuestan un stat extra, para saber a qué apuntan.
+/// stat. Solo los symlinks cuestan un stat y un readlink extra, para saber a
+/// qué apuntan.
 fn entry_from(de: &fs::DirEntry) -> Entry {
     let name = de.file_name();
     let display = crate::text::sanitize(&name.to_string_lossy());
     let ft = de.file_type().ok();
     let is_link = ft.is_some_and(|t| t.is_symlink());
-    let is_dir = if is_link {
-        fs::metadata(de.path()).is_ok_and(|m| m.is_dir())
+    let (is_dir, broken, link_target) = if is_link {
+        let path = de.path();
+        let meta = fs::metadata(&path);
+        let target = fs::read_link(&path)
+            .ok()
+            .map(|t| crate::text::sanitize(&t.to_string_lossy()));
+        (meta.as_ref().is_ok_and(|m| m.is_dir()), meta.is_err(), target)
     } else {
-        ft.is_some_and(|t| t.is_dir())
+        (ft.is_some_and(|t| t.is_dir()), false, None)
     };
     Entry {
         name,
         display,
         is_dir,
         is_link,
+        link_target,
+        broken,
     }
 }
 
@@ -102,7 +114,13 @@ const PREVIEW_BYTES: usize = 16 * 1024;
 pub fn preview(path: &Path, show_hidden: bool, rows: usize) -> Preview {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(e) => return Preview::Error(e.to_string()),
+        Err(e) => {
+            if let Ok(target) = fs::read_link(path) {
+                let target = crate::text::sanitize(&target.to_string_lossy());
+                return Preview::Error(format!("broken symlink -> {target}"));
+            }
+            return Preview::Error(e.to_string());
+        }
     };
     if meta.is_dir() {
         return match read_dir_limited(path, show_hidden, rows) {
@@ -197,7 +215,17 @@ mod tests {
         std::os::unix::fs::symlink(d.join("real"), d.join("alias")).unwrap();
         let e = read_dir(&d, false, false).unwrap();
         let alias = e.iter().find(|e| e.display == "alias").unwrap();
-        assert!(alias.is_dir && alias.is_link);
+        assert!(alias.is_dir && alias.is_link && !alias.broken);
+        assert_eq!(alias.link_target.as_deref(), Some(d.join("real").to_str().unwrap()));
+        std::os::unix::fs::symlink("nowhere", d.join("dead")).unwrap();
+        let e = read_dir(&d, false, false).unwrap();
+        let dead = e.iter().find(|e| e.display == "dead").unwrap();
+        assert!(dead.broken && !dead.is_dir);
+        assert_eq!(dead.link_target.as_deref(), Some("nowhere"));
+        match preview(&d.join("dead"), false, 5) {
+            Preview::Error(m) => assert_eq!(m, "broken symlink -> nowhere"),
+            other => panic!("{other:?}"),
+        }
         fs::remove_dir_all(&d).unwrap();
     }
 

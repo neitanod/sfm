@@ -57,6 +57,7 @@ const LINES: &[Line] = &[
     Section("VIEW"),
     Key(".", "show / hide dotfiles"),
     Key("r   Ctrl-L", "reload"),
+    Note("Symlinks are cyan and show name -> target on their own row; a broken symlink is red."),
     Note("The bottom bar shows the position, permissions, size, symlink target, [hidden] when dotfiles are shown, and what is marked."),
     Note("A folder preview reads one screenful of entries, so huge folders open fast. A text file shows its first lines; binary and special files are never opened."),
     Note("Folders on screen refresh by themselves when they change. If the current folder is deleted or moved, sfm climbs to the nearest folder that still exists. Where inotify is unavailable, r reloads by hand."),

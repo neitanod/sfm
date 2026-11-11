@@ -19,6 +19,8 @@ estático que se copia a cualquier Linux x86_64 y anda.
 
 - **Izquierda:** las carpetas de la carpeta padre, con la actual resaltada.
 - **Centro:** la carpeta actual. Acá está el cursor.
+- Los symlinks van en cian y muestran `nombre -> destino` en su propia fila,
+  en las tres columnas; un symlink roto va en rojo.
 - **Derecha:** el preview de lo que está bajo el cursor. Una carpeta muestra
   sus primeras entradas (deja de leer al llenar la pantalla, así que una
   carpeta con un millón de archivos cuesta lo mismo que una con diez). Un

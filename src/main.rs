@@ -669,7 +669,9 @@ impl App {
         if e.is_dir {
             name.push('/');
         }
-        let style = if e.is_link {
+        let style = if e.broken {
+            STYLE_ERROR
+        } else if e.is_link {
             STYLE_LINK
         } else if e.is_dir {
             STYLE_DIR
@@ -683,7 +685,17 @@ impl App {
         } else {
             format!("{sel} {RESET}")
         };
-        format!("{mark}{style}{sel}{}{RESET}", fit(&name, width - 1))
+        let avail = width - 1;
+        let name_w: usize = name.chars().map(text::char_width).sum();
+        // El destino del symlink va en gris después del nombre; si no entra
+        // todo, se recorta primero el destino.
+        match &e.link_target {
+            Some(target) if name_w + 4 < avail => format!(
+                "{mark}{style}{sel}{name}{RESET}{STYLE_DIM}{sel}{}{RESET}",
+                fit(&format!(" -> {target}"), avail - name_w)
+            ),
+            _ => format!("{mark}{style}{sel}{}{RESET}", fit(&name, avail)),
+        }
     }
 
     /// Primera fila visible de la columna izquierda y posición de la carpeta
@@ -1559,5 +1571,38 @@ mod tests {
         assert_eq!(q("/tmp/it's"), "'/tmp/it'\\''s'");
         assert_eq!(q("/tmp/$HOME"), "'/tmp/$HOME'");
         assert_eq!(q("/tmp/ñandú"), "'/tmp/ñandú'");
+    }
+
+    #[test]
+    fn symlinks_show_their_target_on_the_same_row() {
+        let d = tree("linkrow");
+        std::os::unix::fs::symlink("alpha/notes.txt", d.join("to-notes")).unwrap();
+        std::os::unix::fs::symlink("gone", d.join("broken")).unwrap();
+        let mut app = drawn(d.clone());
+        let plain = |s: String| {
+            let mut out = String::new();
+            let mut it = s.chars();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for c2 in it.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let frame = plain(app.render(12, 120));
+        assert!(frame.contains("to-notes -> alpha/notes.txt"), "{frame}");
+        assert!(frame.contains("broken -> gone"));
+        // Rojo para el roto
+        assert!(app.render(12, 120).contains("\x1b[31mbroken"));
+        // Angosto: el nombre se ve aunque el destino no entre
+        let narrow = plain(app.render(12, 40));
+        assert!(narrow.contains("to-not"), "{narrow}");
+        fs::remove_dir_all(&d).unwrap();
     }
 }
