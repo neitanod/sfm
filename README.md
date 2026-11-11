@@ -30,7 +30,7 @@ any x86_64 Linux machine and run.
 | `←` (`h`, Backspace) | Go to the parent folder (`cd ..`) |
 | `→` (`l`, Enter) | Enter the folder under the cursor |
 | PgUp PgDn Home End (`g` `G`) | Jump |
-| `c` | Mark the file or folder under the cursor |
+| `c` | Mark the file or folder under the cursor (shown with a yellow `*`). Marking something else replaces the mark; `c` on the marked entry unmarks it |
 | `p` | Paste a copy of the marked entry here (`cp -a`), after a y/N confirmation |
 | `m` | Move the marked entry here (`mv`), after a y/N confirmation |
 | `e` | Edit the file under the cursor with `$VISUAL`, `$EDITOR`, `vim` or `vi` |
@@ -38,7 +38,7 @@ any x86_64 Linux machine and run.
 | `r` | Reload |
 | `q` Esc Ctrl-C | Quit |
 
-`p` and `m` never overwrite: if an entry with the same name already exists in
+After a paste or a move the mark is cleared. `p` and `m` never overwrite: if an entry with the same name already exists in
 the current folder they refuse and say so. A folder can't be pasted or moved
 inside itself.
 

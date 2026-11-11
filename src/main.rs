@@ -25,6 +25,7 @@ const STYLE_HEADER: &str = "\x1b[1;32m";
 const STYLE_ERROR: &str = "\x1b[31m";
 const STYLE_PROMPT: &str = "\x1b[1;33m";
 const STYLE_OK: &str = "\x1b[32m";
+const STYLE_MARK: &str = "\x1b[1;33m";
 const RESET: &str = "\x1b[0m";
 
 const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  . hidden  q quit";
@@ -178,13 +179,29 @@ impl App {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
     }
 
+    /// Marca lo que está bajo el cursor. Hay una sola marca: marcar otra cosa
+    /// reemplaza la anterior, y marcar lo ya marcado lo desmarca.
     fn mark(&mut self) {
-        if let (Some(path), Some(e)) = (self.selected_path(), self.selected()) {
-            self.message = Some(Notice::Info(format!(
-                "marked {} — p pastes a copy here, m moves it here",
-                e.display
-            )));
+        let (Some(path), Some(e)) = (self.selected_path(), self.selected()) else {
+            return;
+        };
+        let name = e.display.clone();
+        if self.clipboard.as_ref() == Some(&path) {
+            self.clipboard = None;
+            self.message = Some(Notice::Info(format!("unmarked {name}")));
+        } else {
             self.clipboard = Some(path);
+            self.message = Some(Notice::Info(format!(
+                "marked {name} — p pastes a copy here, m moves it here"
+            )));
+        }
+    }
+
+    /// Si la entrada `name` de la carpeta `dir` es la que está marcada.
+    fn is_marked(&self, dir: Option<&Path>, e: &Entry) -> bool {
+        match (&self.clipboard, dir) {
+            (Some(c), Some(d)) => c.parent() == Some(d) && c.file_name() == Some(e.name.as_os_str()),
+            _ => false,
         }
     }
 
@@ -207,9 +224,8 @@ impl App {
         let name = p.dest.file_name().map(|n| n.to_os_string());
         match run_transfer(&p) {
             Ok(()) => {
-                if p.op == Op::Move {
-                    self.clipboard = None;
-                }
+                // Hecha la operación, la marca ya cumplió.
+                self.clipboard = None;
                 self.preview_cache = None;
                 self.change_dir(self.cwd.clone(), name);
                 self.message = Some(Notice::Info(format!(
@@ -330,7 +346,10 @@ impl App {
         out
     }
 
-    fn entry_cell(e: &Entry, width: usize, selected: bool) -> String {
+    fn entry_cell(e: &Entry, width: usize, selected: bool, marked: bool) -> String {
+        if width == 0 {
+            return String::new();
+        }
         let mut name = e.display.clone();
         if e.is_dir {
             name.push('/');
@@ -343,11 +362,18 @@ impl App {
             ""
         };
         let sel = if selected { STYLE_SELECTED } else { "" };
-        format!("{style}{sel}{}{RESET}", fit(&format!(" {name}"), width))
+        // La primera columna de la celda lleva el indicador de marca.
+        let mark = if marked {
+            format!("{STYLE_MARK}{sel}*{RESET}")
+        } else {
+            format!("{sel} {RESET}")
+        };
+        format!("{mark}{style}{sel}{}{RESET}", fit(&name, width - 1))
     }
 
     fn left_column(&self, height: usize, width: usize) -> Vec<String> {
         let current = self.cwd.file_name();
+        let parent_dir = self.cwd.parent();
         let idx = self
             .parent
             .iter()
@@ -359,7 +385,12 @@ impl App {
             .min(self.parent.len().saturating_sub(height));
         (0..height)
             .map(|row| match self.parent.get(start + row) {
-                Some(e) => Self::entry_cell(e, width, Some(start + row) == idx),
+                Some(e) => Self::entry_cell(
+                    e,
+                    width,
+                    Some(start + row) == idx,
+                    self.is_marked(parent_dir, e),
+                ),
                 None => fit("", width),
             })
             .collect()
@@ -370,7 +401,12 @@ impl App {
             .map(|row| {
                 let i = self.offset + row;
                 match self.entries.get(i) {
-                    Some(e) => Self::entry_cell(e, width, i == self.cursor),
+                    Some(e) => Self::entry_cell(
+                        e,
+                        width,
+                        i == self.cursor,
+                        self.is_marked(Some(&self.cwd), e),
+                    ),
                     None if i == 0 => format!("{STYLE_DIM}{}{RESET}", fit("  (empty)", width)),
                     None => fit("", width),
                 }
@@ -379,13 +415,21 @@ impl App {
     }
 
     fn right_column(&mut self, height: usize, width: usize) -> Vec<String> {
+        // Lo marcado, visto desde la carpeta que muestra el preview.
+        let shown = self.selected_path();
+        let marked_name = match (&self.clipboard, &shown) {
+            (Some(c), Some(dir)) if c.parent() == Some(dir.as_path()) => {
+                c.file_name().map(|n| n.to_os_string())
+            }
+            _ => None,
+        };
         let mut lines: Vec<String> = match self.preview(height) {
             None => Vec::new(),
             Some(Preview::Dir { entries, more }) => {
                 let mut v: Vec<String> = entries
                     .iter()
                     .take(height)
-                    .map(|e| Self::entry_cell(e, width, false))
+                    .map(|e| Self::entry_cell(e, width, false, marked_name.as_ref() == Some(&e.name)))
                     .collect();
                 if entries.is_empty() {
                     v.push(format!("{STYLE_DIM}{}{RESET}", fit("  (empty)", width)));
@@ -698,8 +742,15 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("beta/zfile.txt")).unwrap(), "hello\n");
         assert!(d.join("zfile.txt").exists());
         assert_eq!(app.selected().unwrap().display, "zfile.txt");
+        // Pegar desmarca
+        assert!(app.clipboard.is_none());
 
         // Pegar otra vez en el mismo lugar no pisa
+        app.handle(Key::Left, 10);
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('c'), 10);
+        select(&mut app, "beta");
+        app.handle(Key::Right, 10);
         app.handle(Key::Char('P'), 10);
         assert!(app.pending.is_none());
         assert!(matches!(app.message, Some(Notice::Error(_))));
@@ -759,6 +810,24 @@ mod tests {
         select(&mut app, "zfile.txt");
         app.handle(Key::Char('E'), 10);
         assert_eq!(app.edit_request, Some(d.join("zfile.txt")));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn marking_replaces_and_toggles() {
+        let d = tree("marks");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('c'), 10);
+        select(&mut app, "beta");
+        app.handle(Key::Char('c'), 10);
+        assert_eq!(app.clipboard, Some(d.join("beta")));
+        // La marca se ve en la lista y la anterior ya no
+        let frame = app.render(10, 100);
+        assert!(frame.contains("*\x1b[0m\x1b[1;34m\x1b[7mbeta/"));
+        assert_eq!(frame.matches("\x1b[1;33m").count(), 1);
+        app.handle(Key::Char('c'), 10);
+        assert!(app.clipboard.is_none());
         fs::remove_dir_all(&d).unwrap();
     }
 }

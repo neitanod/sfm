@@ -31,7 +31,7 @@ estático que se copia a cualquier Linux x86_64 y anda.
 | `←` (`h`, Backspace) | Ir a la carpeta padre (`cd ..`) |
 | `→` (`l`, Enter) | Entrar a la carpeta bajo el cursor |
 | RePág AvPág Inicio Fin (`g` `G`) | Saltar |
-| `c` | Marcar el archivo o la carpeta bajo el cursor |
+| `c` | Marcar el archivo o la carpeta bajo el cursor (se ve con un `*` amarillo). Marcar otra cosa reemplaza la marca; `c` sobre lo marcado lo desmarca |
 | `p` | Pegar acá una copia de lo marcado (`cp -a`), con confirmación y/N |
 | `m` | Mover acá lo marcado (`mv`), con confirmación y/N |
 | `e` | Editar el archivo bajo el cursor con `$VISUAL`, `$EDITOR`, `vim` o `vi` |
@@ -39,7 +39,7 @@ estático que se copia a cualquier Linux x86_64 y anda.
 | `r` | Recargar |
 | `q` Esc Ctrl-C | Salir |
 
-`p` y `m` nunca pisan nada: si en la carpeta actual ya hay algo con el mismo
+Después de pegar o mover, la marca se borra. `p` y `m` nunca pisan nada: si en la carpeta actual ya hay algo con el mismo
 nombre, se niegan y lo dicen. Una carpeta no se puede pegar ni mover dentro de
 sí misma.
 
