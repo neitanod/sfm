@@ -38,7 +38,17 @@ unsafe extern "C" {
     fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
     fn tcsetattr(fd: i32, action: i32, termios: *const Termios) -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
 }
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x1;
 
 const STDIN: i32 = 0;
 const STDOUT: i32 = 1;
@@ -88,10 +98,9 @@ pub fn enter() -> io::Result<()> {
     raw.c_oflag &= !OPOST;
     raw.c_cflag |= CS8;
     raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
-    // read() vuelve con lo que haya o a las 2 décimas: así se detecta el
-    // cambio de tamaño de la ventana sin manejar señales.
+    // read() vuelve en el acto con lo que haya: la espera la hace wait().
     raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 2;
+    raw.c_cc[VTIME] = 0;
     let _ = RAW.set(raw);
 
     let prev = std::panic::take_hook();
@@ -151,7 +160,30 @@ pub enum Key {
     Char(char),
 }
 
-/// Lee lo que haya en stdin (espera como mucho 2 décimas) y lo traduce a teclas.
+/// Espera hasta `timeout_ms` a que haya teclas en stdin o datos en `extra`.
+/// Devuelve (hay teclas, hay datos en extra). El timeout corto es lo que
+/// permite notar el cambio de tamaño de la ventana sin manejar señales.
+pub fn wait(extra: Option<i32>, timeout_ms: i32) -> (bool, bool) {
+    let mut fds = [
+        PollFd {
+            fd: STDIN,
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: extra.unwrap_or(-1),
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    let n = if extra.is_some() { 2 } else { 1 };
+    if unsafe { poll(fds.as_mut_ptr(), n, timeout_ms) } <= 0 {
+        return (false, false);
+    }
+    (fds[0].revents != 0, fds[1].revents != 0)
+}
+
+/// Lee lo que haya en stdin sin esperar y lo traduce a teclas.
 pub fn read_keys() -> io::Result<Vec<Key>> {
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(STDIN) });
     let mut buf = [0u8; 256];

@@ -7,6 +7,7 @@ mod clock;
 mod listing;
 mod term;
 mod text;
+mod watch;
 
 use listing::{Entry, Preview};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use term::Key;
 use text::fit;
 
@@ -159,6 +161,51 @@ impl App {
             .unwrap_or(0);
         self.offset = 0;
         self.load_parent();
+    }
+
+    /// Carpetas que hay que vigilar: la actual, la padre y la del preview.
+    fn watch_paths(&self) -> (PathBuf, Option<PathBuf>, Option<PathBuf>) {
+        let preview = self
+            .selected()
+            .filter(|e| e.is_dir)
+            .and_then(|_| self.selected_path());
+        (
+            self.cwd.clone(),
+            self.cwd.parent().map(Path::to_path_buf),
+            preview,
+        )
+    }
+
+    /// Aplica los cambios que avisó el disco. El cursor se queda sobre el
+    /// mismo elemento; si ese elemento desapareció, sobre el que ocupó su lugar.
+    fn apply(&mut self, c: watch::Changes) {
+        if c.current_gone || !self.cwd.is_dir() {
+            let mut dir = self.cwd.clone();
+            while !dir.is_dir() && dir.pop() {}
+            self.preview_cache = None;
+            let gone = self.cwd.display().to_string();
+            self.change_dir(dir, None);
+            self.message = Some(Notice::Error(format!("{gone} was removed or moved")));
+            return;
+        }
+        let selected = self.selected().map(|e| e.name.clone());
+        if c.overflow || c.current {
+            if let Ok(entries) = listing::read_dir(&self.cwd, self.show_hidden, false) {
+                let idx = self.cursor;
+                self.entries = entries;
+                self.cursor = selected
+                    .as_ref()
+                    .and_then(|n| self.entries.iter().position(|e| &e.name == n))
+                    .unwrap_or_else(|| idx.min(self.entries.len().saturating_sub(1)));
+            }
+        }
+        if c.overflow || c.parent {
+            self.load_parent();
+        }
+        let touched_selected = selected.is_some_and(|n| c.touched.contains(&n));
+        if c.overflow || c.current || c.preview || touched_selected {
+            self.preview_cache = None;
+        }
     }
 
     fn reload(&mut self) {
@@ -746,18 +793,52 @@ fn start_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Cada cuánto se aplican, como mucho, los avisos del disco. Una copia de mil
+/// archivos genera mil avisos; así la pantalla se rehace diez veces por
+/// segundo y no mil.
+const REFRESH_EVERY: Duration = Duration::from_millis(100);
+/// Cada cuánto se revisa el tamaño de la ventana si no pasa nada.
+const IDLE_WAIT_MS: i32 = 250;
+
 fn run(start: &Path) -> std::io::Result<()> {
     let mut app = App::new(start.to_path_buf())?;
+    let mut watcher = watch::Watcher::new();
+    let mut changes = watch::Changes::default();
+    let mut last_apply = Instant::now() - REFRESH_EVERY;
     let mut out = std::io::stdout();
     let mut last_size = (0, 0);
     let mut dirty = true;
     while !app.quit {
+        if let Some(w) = watcher.as_mut() {
+            let (cur, parent, preview) = app.watch_paths();
+            w.sync(&cur, parent.as_deref(), preview.as_deref());
+        }
         let (rows, cols) = term::size();
         if dirty || (rows, cols) != last_size {
             out.write_all(app.render(rows, cols).as_bytes())?;
             out.flush()?;
             last_size = (rows, cols);
             dirty = false;
+        }
+
+        let timeout = if changes.is_empty() {
+            IDLE_WAIT_MS
+        } else {
+            REFRESH_EVERY.saturating_sub(last_apply.elapsed()).as_millis() as i32
+        };
+        let (keys_ready, fs_ready) = term::wait(watcher.as_ref().map(|w| w.fd()), timeout);
+        if fs_ready {
+            if let Some(w) = watcher.as_mut() {
+                changes.merge(w.drain());
+            }
+        }
+        if !changes.is_empty() && last_apply.elapsed() >= REFRESH_EVERY {
+            app.apply(std::mem::take(&mut changes));
+            last_apply = Instant::now();
+            dirty = true;
+        }
+        if !keys_ready {
+            continue;
         }
         for key in term::read_keys()? {
             app.handle(key, rows.saturating_sub(2));
@@ -1064,6 +1145,66 @@ mod tests {
             Some(Notice::Error(m)) => assert!(m.contains("can't create"), "{m}"),
             _ => panic!("expected an error"),
         }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn changes() -> watch::Changes {
+        watch::Changes::default()
+    }
+
+    #[test]
+    fn live_refresh_keeps_selection() {
+        let d = tree("live");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "beta");
+        fs::write(d.join("aaa.txt"), "").unwrap();
+        fs::create_dir(d.join("aaa")).unwrap();
+        app.apply(watch::Changes { current: true, ..changes() });
+        assert_eq!(app.selected().unwrap().display, "beta");
+        assert!(app.entries.iter().any(|e| e.display == "aaa.txt"));
+
+        // Si lo seleccionado desaparece, el cursor queda en la misma posición
+        let idx = app.cursor;
+        fs::remove_dir(d.join("beta")).unwrap();
+        app.apply(watch::Changes { current: true, ..changes() });
+        assert_eq!(app.cursor, idx);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn live_refresh_climbs_when_cwd_is_removed() {
+        let d = tree("climb");
+        let mut app = App::new(d.join("alpha/inner")).unwrap();
+        fs::remove_dir_all(d.join("alpha")).unwrap();
+        app.apply(watch::Changes { current_gone: true, ..changes() });
+        assert_eq!(app.cwd, d);
+        assert!(matches!(app.message, Some(Notice::Error(_))));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn touched_selected_file_refreshes_preview() {
+        let d = tree("touch");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "zfile.txt");
+        assert!(app.render(10, 100).contains("hello"));
+        fs::write(d.join("zfile.txt"), "bye\n").unwrap();
+        app.apply(watch::Changes { touched: vec!["zfile.txt".into()], ..changes() });
+        assert!(app.render(10, 100).contains("bye"));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn watch_paths_follow_selection() {
+        let d = tree("paths");
+        let mut app = App::new(d.join("alpha")).unwrap();
+        select(&mut app, "inner");
+        let (cur, parent, preview) = app.watch_paths();
+        assert_eq!(cur, d.join("alpha"));
+        assert_eq!(parent, Some(d.clone()));
+        assert_eq!(preview, Some(d.join("alpha/inner")));
+        select(&mut app, "notes.txt");
+        assert_eq!(app.watch_paths().2, None);
         fs::remove_dir_all(&d).unwrap();
     }
 }
