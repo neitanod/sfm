@@ -3,6 +3,7 @@
 //! Izquierda: carpetas de la carpeta padre. Centro: la carpeta actual, con el
 //! cursor. Derecha: preview de lo que está bajo el cursor.
 
+mod clock;
 mod listing;
 mod term;
 mod text;
@@ -26,15 +27,19 @@ const STYLE_ERROR: &str = "\x1b[31m";
 const STYLE_PROMPT: &str = "\x1b[1;33m";
 const STYLE_OK: &str = "\x1b[32m";
 const STYLE_MARK: &str = "\x1b[1;33m";
+const STYLE_DANGER: &str = "\x1b[1;97;41m";
 const RESET: &str = "\x1b[0m";
 
-const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  . hidden  q quit";
-const HELP_SHORT: &str = "c p m e . q";
+const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  B backup  D delete  . hidden  q quit";
+const HELP_SHORT: &str = "c p m e B D . q";
+const BACKUP_DIR: &str = "sfm_backups";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Copy,
     Move,
+    Delete,
+    Backup,
 }
 
 impl Op {
@@ -42,11 +47,14 @@ impl Op {
         match self {
             Op::Copy => "copy",
             Op::Move => "move",
+            Op::Delete => "delete",
+            Op::Backup => "backup",
         }
     }
 }
 
-/// Operación esperando la confirmación y/N.
+/// Operación esperando confirmación: y/N, o `Y` mayúscula para borrar.
+/// En Delete, `dest` es igual a `src`.
 #[derive(Debug)]
 struct Pending {
     op: Op,
@@ -75,6 +83,8 @@ struct App {
     pending: Option<Pending>,
     /// Archivo a abrir en el editor; lo atiende el loop, que maneja la terminal.
     edit_request: Option<PathBuf>,
+    /// Dónde van los backups de B: ~/sfm_backups.
+    backup_dir: Option<PathBuf>,
     preview_cache: Option<(PathBuf, usize, bool, Preview)>,
     quit: bool,
 }
@@ -93,6 +103,7 @@ impl App {
             clipboard: None,
             pending: None,
             edit_request: None,
+            backup_dir: std::env::var_os("HOME").map(|h| PathBuf::from(h).join(BACKUP_DIR)),
             preview_cache: None,
             quit: false,
         };
@@ -220,7 +231,101 @@ impl App {
         }
     }
 
+    /// Pide confirmación dura para borrar lo que está bajo el cursor. Borra
+    /// archivos, symlinks y carpetas vacías; una carpeta con contenido no.
+    fn request_delete(&mut self) {
+        let Some(path) = self.selected_path() else { return };
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                self.message = Some(Notice::Error(format!("{}: {e}", path.display())));
+                return;
+            }
+        };
+        if meta.is_dir() {
+            let empty = std::fs::read_dir(&path)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                self.message = Some(Notice::Error(
+                    "folder not empty: D only deletes files and empty folders".into(),
+                ));
+                return;
+            }
+        }
+        self.pending = Some(Pending {
+            op: Op::Delete,
+            src: path.clone(),
+            dest: path,
+        });
+    }
+
+    /// Pide confirmación para copiar lo que está bajo el cursor a
+    /// ~/sfm_backups/<nombre>_AAAA-MM-DD-HHMM.
+    fn request_backup(&mut self) {
+        let Some(src) = self.selected_path() else { return };
+        let Some(dir) = self.backup_dir.clone() else {
+            self.message = Some(Notice::Error("backup: $HOME is not set".into()));
+            return;
+        };
+        let Some(name) = src.file_name() else { return };
+        let dest = backup_dest(&dir, name, &clock::stamp());
+        self.pending = Some(Pending {
+            op: Op::Backup,
+            src,
+            dest,
+        });
+    }
+
     fn confirm(&mut self, p: Pending) {
+        match p.op {
+            Op::Copy | Op::Move => self.confirm_transfer(p),
+            Op::Delete => self.confirm_delete(p),
+            Op::Backup => self.confirm_backup(p),
+        }
+    }
+
+    fn confirm_delete(&mut self, p: Pending) {
+        let is_dir = std::fs::symlink_metadata(&p.src).is_ok_and(|m| m.is_dir());
+        let result = if is_dir {
+            std::fs::remove_dir(&p.src)
+        } else {
+            std::fs::remove_file(&p.src)
+        };
+        if let Err(e) = result {
+            self.message = Some(Notice::Error(format!("delete failed: {e}")));
+            return;
+        }
+        if self.clipboard.as_ref() == Some(&p.src) {
+            self.clipboard = None;
+        }
+        // El cursor queda en la misma posición, sobre el elemento siguiente.
+        let idx = self.cursor;
+        self.preview_cache = None;
+        self.change_dir(self.cwd.clone(), None);
+        self.cursor = idx.min(self.entries.len().saturating_sub(1));
+        self.message = Some(Notice::Info(format!("deleted {}", p.src.display())));
+    }
+
+    fn confirm_backup(&mut self, p: Pending) {
+        if let Some(dir) = p.dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                self.message = Some(Notice::Error(format!(
+                    "backup: can't create {}: {e}",
+                    dir.display()
+                )));
+                return;
+            }
+        }
+        match run_transfer(&p) {
+            Ok(()) => {
+                self.message = Some(Notice::Info(format!("backup: {}", p.dest.display())))
+            }
+            Err(e) => self.message = Some(Notice::Error(e)),
+        }
+    }
+
+    fn confirm_transfer(&mut self, p: Pending) {
         let name = p.dest.file_name().map(|n| n.to_os_string());
         match run_transfer(&p) {
             Ok(()) => {
@@ -250,7 +355,12 @@ impl App {
     fn handle(&mut self, key: Key, page: usize) {
         self.message = None;
         if let Some(p) = self.pending.take() {
-            if matches!(key, Key::Char('y') | Key::Char('Y')) {
+            // Borrar exige la Y mayúscula; lo demás acepta y o Y.
+            let confirmed = match p.op {
+                Op::Delete => key == Key::Char('Y'),
+                _ => matches!(key, Key::Char('y') | Key::Char('Y')),
+            };
+            if confirmed {
                 self.confirm(p);
             } else {
                 self.message = Some(Notice::Info(format!("{} cancelled", p.op.verb())));
@@ -276,6 +386,8 @@ impl App {
             Key::Char('p') | Key::Char('P') => self.request(Op::Copy),
             Key::Char('m') | Key::Char('M') => self.request(Op::Move),
             Key::Char('e') | Key::Char('E') => self.edit(),
+            Key::Char('D') => self.request_delete(),
+            Key::Char('B') => self.request_backup(),
             Key::Char('q') | Key::Esc | Key::Ctrl(b'c') => self.quit = true,
             _ => {}
         }
@@ -459,13 +571,29 @@ impl App {
 
     fn status_line(&self, cols: usize) -> String {
         if let Some(p) = &self.pending {
-            let q = format!(
-                " {} {} → {}/ ? [y/N]",
-                p.op.verb(),
-                p.src.display(),
-                self.cwd.display()
-            );
-            return format!("{STYLE_PROMPT}{}{RESET}", fit(&text::sanitize(&q), cols));
+            let (style, q) = match p.op {
+                Op::Copy | Op::Move => (
+                    STYLE_PROMPT,
+                    format!(
+                        " {} {} → {}/ ? [y/N]",
+                        p.op.verb(),
+                        p.src.display(),
+                        self.cwd.display()
+                    ),
+                ),
+                Op::Backup => (
+                    STYLE_PROMPT,
+                    format!(" backup {} → {} ? [y/N]", p.src.display(), p.dest.display()),
+                ),
+                Op::Delete => (
+                    STYLE_DANGER,
+                    format!(
+                        " DELETE {} ? Type Y (uppercase) to confirm, any other key cancels",
+                        p.src.display()
+                    ),
+                ),
+            };
+            return format!("{style}{}{RESET}", fit(&text::sanitize(&q), cols));
         }
         if let Some(n) = &self.message {
             let (style, msg) = match n {
@@ -532,10 +660,32 @@ fn check_transfer(src: &Path, dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-/// Corre `cp -a` o `mv` y devuelve el error de la herramienta si falla.
+/// Destino de un backup: <dir>/<nombre>_<stamp>, o con -2, -3… si en el
+/// mismo minuto ya se hizo otro.
+fn backup_dest(dir: &Path, name: &std::ffi::OsStr, stamp: &str) -> PathBuf {
+    let mut base = name.to_os_string();
+    base.push("_");
+    base.push(stamp);
+    let first = dir.join(&base);
+    if std::fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    (2..)
+        .map(|n| {
+            let mut alt = base.clone();
+            alt.push(format!("-{n}"));
+            dir.join(alt)
+        })
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("some free name")
+}
+
+/// Corre `cp -a` (copia y backup) o `mv` y devuelve el error de la
+/// herramienta si falla.
 fn run_transfer(p: &Pending) -> Result<(), String> {
     let mut cmd = match p.op {
-        Op::Copy => {
+        Op::Delete => return Err("delete is not a transfer".into()),
+        Op::Copy | Op::Backup => {
             let mut c = std::process::Command::new("cp");
             c.arg("-a");
             c
@@ -828,6 +978,92 @@ mod tests {
         assert_eq!(frame.matches("\x1b[1;33m").count(), 1);
         app.handle(Key::Char('c'), 10);
         assert!(app.clipboard.is_none());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn delete_needs_uppercase_y() {
+        let d = tree("delete");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "zfile.txt");
+        let idx = app.cursor;
+        app.handle(Key::Char('d'), 10); // minúscula: nada
+        assert!(app.pending.is_none());
+        app.handle(Key::Char('D'), 10);
+        app.handle(Key::Char('y'), 10); // minúscula cancela
+        assert!(d.join("zfile.txt").exists());
+        app.handle(Key::Char('D'), 10);
+        app.handle(Key::Enter, 10); // Enter también cancela
+        assert!(d.join("zfile.txt").exists());
+        app.handle(Key::Char('c'), 10);
+        app.handle(Key::Char('D'), 10);
+        app.handle(Key::Char('Y'), 10);
+        assert!(!d.join("zfile.txt").exists());
+        assert!(app.clipboard.is_none()); // estaba marcado: se desmarca
+        assert_eq!(app.cursor, idx.min(app.entries.len() - 1));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn delete_only_empty_folders() {
+        let d = tree("delete-dir");
+        let mut app = App::new(d.clone()).unwrap();
+        select(&mut app, "alpha");
+        app.handle(Key::Char('D'), 10);
+        assert!(app.pending.is_none());
+        assert!(matches!(app.message, Some(Notice::Error(_))));
+        select(&mut app, "beta");
+        app.handle(Key::Char('D'), 10);
+        app.handle(Key::Char('Y'), 10);
+        assert!(!d.join("beta").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backup_with_timestamp_and_no_overwrite() {
+        let d = tree("backup");
+        let mut app = App::new(d.clone()).unwrap();
+        let bdir = d.join("home/sfm_backups");
+        app.backup_dir = Some(bdir.clone());
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('b'), 10); // minúscula: nada
+        assert!(app.pending.is_none());
+        app.handle(Key::Char('B'), 10);
+        app.handle(Key::Char('n'), 10);
+        assert!(!bdir.exists());
+        app.handle(Key::Char('B'), 10);
+        app.handle(Key::Char('y'), 10);
+        app.handle(Key::Char('B'), 10);
+        app.handle(Key::Char('y'), 10);
+        let mut names: Vec<String> = fs::read_dir(&bdir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].starts_with("zfile.txt_20"), "{names:?}");
+        assert_eq!(names[0].len(), "zfile.txt_2026-10-25-1235".len());
+        // Si cambió el minuto entre los dos, igual son dos archivos distintos.
+        assert!(names[1].ends_with("-2") || names[1] != names[0]);
+        assert_eq!(fs::read_to_string(bdir.join(&names[0])).unwrap(), "hello\n");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backup_reports_when_dir_cannot_be_created() {
+        let d = tree("backup-fail");
+        let mut app = App::new(d.clone()).unwrap();
+        // Un archivo donde debería ir la carpeta: create_dir_all falla.
+        fs::write(d.join("blocker"), "").unwrap();
+        app.backup_dir = Some(d.join("blocker/sfm_backups"));
+        app.reload();
+        select(&mut app, "zfile.txt");
+        app.handle(Key::Char('B'), 10);
+        app.handle(Key::Char('y'), 10);
+        match &app.message {
+            Some(Notice::Error(m)) => assert!(m.contains("can't create"), "{m}"),
+            _ => panic!("expected an error"),
+        }
         fs::remove_dir_all(&d).unwrap();
     }
 }

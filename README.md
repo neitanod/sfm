@@ -34,6 +34,8 @@ any x86_64 Linux machine and run.
 | `p` | Paste a copy of the marked entry here (`cp -a`), after a y/N confirmation |
 | `m` | Move the marked entry here (`mv`), after a y/N confirmation |
 | `e` | Edit the file under the cursor with `$VISUAL`, `$EDITOR`, `vim` or `vi` |
+| `B` | Back up the entry under the cursor to `~/sfm_backups/<name>_YYYY-MM-DD-HHMM` (`cp -a`), after a y/N confirmation. The folder is created if missing |
+| `D` | Delete the file, symlink or empty folder under the cursor. Only an uppercase `Y` confirms; any other key cancels |
 | `.` | Show or hide dotfiles |
 | `r` | Reload |
 | `q` Esc Ctrl-C | Quit |
@@ -41,6 +43,10 @@ any x86_64 Linux machine and run.
 After a paste or a move the mark is cleared. `p` and `m` never overwrite: if an entry with the same name already exists in
 the current folder they refuse and say so. A folder can't be pasted or moved
 inside itself.
+
+`B` and `D` are uppercase only, so a stray `b` or `d` does nothing. A second
+backup of the same entry within the same minute gets a `-2` suffix instead of
+replacing the first one. `D` refuses folders that still have something inside.
 
 ## Install
 

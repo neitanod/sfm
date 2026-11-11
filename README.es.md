@@ -35,6 +35,8 @@ estático que se copia a cualquier Linux x86_64 y anda.
 | `p` | Pegar acá una copia de lo marcado (`cp -a`), con confirmación y/N |
 | `m` | Mover acá lo marcado (`mv`), con confirmación y/N |
 | `e` | Editar el archivo bajo el cursor con `$VISUAL`, `$EDITOR`, `vim` o `vi` |
+| `B` | Hacer un backup de lo que está bajo el cursor en `~/sfm_backups/<nombre>_AAAA-MM-DD-HHMM` (`cp -a`), con confirmación y/N. Si la carpeta no existe, la crea |
+| `D` | Borrar el archivo, symlink o carpeta vacía bajo el cursor. Sólo confirma una `Y` mayúscula; cualquier otra tecla cancela |
 | `.` | Mostrar u ocultar los archivos que empiezan con punto |
 | `r` | Recargar |
 | `q` Esc Ctrl-C | Salir |
@@ -42,6 +44,11 @@ estático que se copia a cualquier Linux x86_64 y anda.
 Después de pegar o mover, la marca se borra. `p` y `m` nunca pisan nada: si en la carpeta actual ya hay algo con el mismo
 nombre, se niegan y lo dicen. Una carpeta no se puede pegar ni mover dentro de
 sí misma.
+
+`B` y `D` van sólo en mayúscula, así que una `b` o una `d` sueltas no hacen
+nada. Un segundo backup de lo mismo dentro del mismo minuto lleva `-2` al final
+en vez de pisar al primero. `D` rechaza las carpetas que todavía tienen algo
+adentro.
 
 ## Instalación
 
