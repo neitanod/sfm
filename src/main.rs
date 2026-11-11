@@ -4,6 +4,7 @@
 //! cursor. Derecha: preview de lo que está bajo el cursor.
 
 mod clock;
+mod help;
 mod listing;
 mod term;
 mod text;
@@ -32,8 +33,8 @@ const STYLE_MARK: &str = "\x1b[1;33m";
 const STYLE_DANGER: &str = "\x1b[1;97;41m";
 const RESET: &str = "\x1b[0m";
 
-const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  B backup  D delete  . hidden  q quit";
-const HELP_SHORT: &str = "c p m e B D . q";
+const HELP: &str = "←↑↓→ move  c copy  p paste  m move  e edit  B backup  D delete  H help  q quit";
+const HELP_SHORT: &str = "H help  q quit";
 const BACKUP_DIR: &str = "sfm_backups";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,8 @@ struct App {
     layout: Layout,
     /// Último click, para reconocer el doble click.
     last_click: Option<(Instant, usize, usize)>,
+    /// Pantalla de ayuda abierta, con su línea de scroll.
+    help: Option<usize>,
     quit: bool,
 }
 
@@ -136,6 +139,7 @@ impl App {
             preview_cache: None,
             layout: Layout::default(),
             last_click: None,
+            help: None,
             quit: false,
         };
         app.entries = listing::read_dir(&start, false, false)?;
@@ -505,7 +509,34 @@ impl App {
         }
     }
 
+    /// Con la ayuda abierta, las flechas, las páginas y la rueda la desplazan
+    /// y cualquier otra tecla la cierra.
+    fn handle_help(&mut self, key: Key, scroll: usize) {
+        let rows = self.layout.height + 2;
+        let page = rows.saturating_sub(2).max(1) as isize;
+        let delta = match key {
+            Key::Up | Key::Char('k') => -1,
+            Key::Down | Key::Char('j') => 1,
+            Key::PageUp => -page,
+            Key::PageDown => page,
+            Key::Mouse { kind: MouseKind::WheelUp, .. } => -WHEEL_STEP,
+            Key::Mouse { kind: MouseKind::WheelDown, .. } => WHEEL_STEP,
+            Key::Mouse { kind: MouseKind::Other, .. } => 0,
+            _ => {
+                self.help = None;
+                return;
+            }
+        };
+        let cols = self.layout.left + self.layout.center + self.layout.right + if self.layout.left > 0 { 2 } else { 0 };
+        let max = help::max_scroll(rows, cols) as isize;
+        self.help = Some((scroll as isize + delta).clamp(0, max) as usize);
+    }
+
     fn handle(&mut self, key: Key, page: usize) {
+        if let Some(scroll) = self.help {
+            self.handle_help(key, scroll);
+            return;
+        }
         if let Key::Mouse { kind, col, row } = key {
             // Con una confirmación en pantalla, el mouse no hace nada: así
             // un movimiento de la rueda no la cancela.
@@ -550,6 +581,7 @@ impl App {
             Key::Char('e') | Key::Char('E') => self.edit(),
             Key::Char('D') => self.request_delete(),
             Key::Char('B') => self.request_backup(),
+            Key::Char('H') | Key::Char('?') => self.help = Some(0),
             Key::Char('q') | Key::Esc | Key::Ctrl(b'c') => self.quit = true,
             _ => {}
         }
@@ -597,6 +629,9 @@ impl App {
             right: right_w,
             height,
         };
+        if let Some(scroll) = self.help {
+            return help::render(rows, cols, scroll.min(help::max_scroll(rows, cols)));
+        }
 
         let left = self.left_column(height, left_w);
         let center = self.center_column(height, center_w);
@@ -1401,6 +1436,29 @@ mod tests {
         app.handle(Key::Mouse { kind: MouseKind::WheelUp, col: 30, row: 3 }, 10);
         assert!(app.pending.is_some());
         assert_eq!(app.cursor, 2);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn help_opens_scrolls_and_closes_without_quitting() {
+        let d = tree("help");
+        let mut app = drawn(d.clone()); // 12 filas
+        app.handle(Key::Char('h'), 10); // minúscula: sube de carpeta, no es la ayuda
+        assert!(app.help.is_none());
+        app.handle(Key::Char('l'), 10);
+        app.handle(Key::Char('H'), 10);
+        assert!(app.render(12, 100).contains("NAVIGATION"));
+        app.handle(Key::Down, 10);
+        assert_eq!(app.help, Some(1));
+        let cursor = app.cursor;
+        app.handle(Key::Char('q'), 10);
+        assert!(app.help.is_none());
+        assert!(!app.quit);
+        assert_eq!(app.cursor, cursor); // la flecha movió la ayuda, no el cursor
+        app.handle(Key::Char('?'), 10);
+        assert!(app.help.is_some());
+        app.handle(Key::Mouse { kind: MouseKind::LeftPress, col: 1, row: 1 }, 10);
+        assert!(app.help.is_none());
         fs::remove_dir_all(&d).unwrap();
     }
 }

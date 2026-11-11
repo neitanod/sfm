@@ -40,6 +40,7 @@ any x86_64 Linux machine and run.
 | `D` | Delete the file, symlink or empty folder under the cursor. Only an uppercase `Y` confirms; any other key cancels |
 | `.` | Show or hide dotfiles |
 | `r` | Reload |
+| `H` `?` | Help screen with everything sfm can do (↑ ↓ scroll it, any other key closes it) |
 | `q` Esc Ctrl-C | Quit |
 
 After a paste or a move the mark is cleared. `p` and `m` never overwrite: if an entry with the same name already exists in

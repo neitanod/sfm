@@ -41,6 +41,7 @@ estático que se copia a cualquier Linux x86_64 y anda.
 | `D` | Borrar el archivo, symlink o carpeta vacía bajo el cursor. Sólo confirma una `Y` mayúscula; cualquier otra tecla cancela |
 | `.` | Mostrar u ocultar los archivos que empiezan con punto |
 | `r` | Recargar |
+| `H` `?` | Pantalla de ayuda con todo lo que hace sfm (↑ ↓ la desplazan, cualquier otra tecla la cierra) |
 | `q` Esc Ctrl-C | Salir |
 
 Después de pegar o mover, la marca se borra. `p` y `m` nunca pisan nada: si en la carpeta actual ya hay algo con el mismo

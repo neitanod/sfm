@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("sfm solo soporta Linux: el layout de termios está declarado a mano");
@@ -201,26 +201,49 @@ pub fn wait(extra: Option<i32>, timeout_ms: i32) -> (bool, bool) {
 }
 
 /// Lee lo que haya en stdin sin esperar y lo traduce a teclas.
+/// Bytes de una secuencia que llegó cortada al final de una lectura; se
+/// completan con la lectura siguiente.
+static PARTIAL: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Una secuencia incompleta más larga que esto es basura y se descarta.
+const MAX_PARTIAL: usize = 64;
+
 pub fn read_keys() -> io::Result<Vec<Key>> {
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(STDIN) });
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 4096];
     let n = match stdin.read(&mut buf) {
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => 0,
         Err(e) => return Err(e),
     };
-    Ok(parse_keys(&buf[..n]))
+    let mut partial = PARTIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut data = std::mem::take(&mut *partial);
+    data.extend_from_slice(&buf[..n]);
+    let (keys, used) = parse(&data);
+    if data.len() - used <= MAX_PARTIAL {
+        *partial = data[used..].to_vec();
+    }
+    Ok(keys)
 }
 
 /// Traduce bytes crudos de la terminal a teclas. Puede venir más de una
-/// tecla por lectura cuando se mantiene apretada una flecha.
+/// tecla por lectura cuando se mantiene apretada una flecha o se mueve rápido
+/// la rueda.
+#[cfg(test)]
 pub fn parse_keys(bytes: &[u8]) -> Vec<Key> {
+    parse(bytes).0
+}
+
+/// Como `parse_keys`, pero se frena antes de una secuencia que quedó
+/// incompleta al final y devuelve cuántos bytes usó.
+fn parse(bytes: &[u8]) -> (Vec<Key>, usize) {
     let mut keys = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == 0x1b {
-            let (key, used) = parse_escape(&bytes[i..]);
+            let Some((key, used)) = parse_escape(&bytes[i..]) else {
+                return (keys, i);
+            };
             keys.push(key);
             i += used;
             continue;
@@ -231,7 +254,10 @@ pub fn parse_keys(bytes: &[u8]) -> Vec<Key> {
             _ => {
                 // Decodificar un caracter UTF-8 completo.
                 let len = utf8_len(b);
-                let end = (i + len).min(bytes.len());
+                if i + len > bytes.len() {
+                    return (keys, i);
+                }
+                let end = i + len;
                 let ch = std::str::from_utf8(&bytes[i..end])
                     .ok()
                     .and_then(|s| s.chars().next());
@@ -245,7 +271,7 @@ pub fn parse_keys(bytes: &[u8]) -> Vec<Key> {
         keys.push(key);
         i += 1;
     }
-    keys
+    (keys, bytes.len())
 }
 
 fn utf8_len(first: u8) -> usize {
@@ -258,14 +284,16 @@ fn utf8_len(first: u8) -> usize {
 }
 
 /// Interpreta una secuencia que empieza con ESC. Devuelve la tecla y cuántos
-/// bytes consumió.
-fn parse_escape(s: &[u8]) -> (Key, usize) {
+/// bytes consumió, o None si la secuencia está cortada y faltan bytes.
+fn parse_escape(s: &[u8]) -> Option<(Key, usize)> {
+    // Un ESC solo al final de la lectura es la tecla Esc.
     if s.len() < 2 {
-        return (Key::Esc, 1);
+        return Some((Key::Esc, 1));
     }
-    match s[1] {
+    Some(match s[1] {
+        b'O' | b'[' if s.len() == 2 => return None,
         // ESC O x: flechas en modo aplicación
-        b'O' if s.len() >= 3 => {
+        b'O' => {
             let key = match s[2] {
                 b'A' => Key::Up,
                 b'B' => Key::Down,
@@ -284,11 +312,11 @@ fn parse_escape(s: &[u8]) -> (Key, usize) {
                 j += 1;
             }
             if j >= s.len() {
-                return (Key::Esc, s.len());
+                return None;
             }
             let params = &s[2..j];
             if params.first() == Some(&b'<') {
-                return (parse_sgr_mouse(&params[1..], s[j]), j + 1);
+                return Some((parse_sgr_mouse(&params[1..], s[j]), j + 1));
             }
             let key = match s[j] {
                 b'A' => Key::Up,
@@ -310,7 +338,7 @@ fn parse_escape(s: &[u8]) -> (Key, usize) {
         }
         // ESC seguido de otra cosa: Alt+tecla. Lo tomamos como ESC solo.
         _ => (Key::Esc, 1),
-    }
+    })
 }
 
 /// Mouse en formato SGR: ESC [ < botón ; columna ; fila (M al apretar, m al soltar).
@@ -340,6 +368,23 @@ fn parse_sgr_mouse(params: &[u8], fin: u8) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_cut_between_reads_is_kept() {
+        // Rueda cortada al final de la lectura: no es un Esc (que saldría).
+        let (keys, used) = parse(b"\x1b[<65;5;5M\x1b[<65;5");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(used, 10);
+        let (keys, _) = parse(b"\x1b[<65;5;5M");
+        assert_eq!(keys.len(), 1);
+        // ESC [ y ESC O al final también esperan
+        assert_eq!(parse(b"j\x1b[").1, 1);
+        assert_eq!(parse(b"j\x1bO").1, 1);
+        // Una ñ partida al medio
+        assert_eq!(parse(&[b'a', 0xc3]), (vec![Key::Char('a')], 1));
+        // Un Esc solo sigue siendo Esc
+        assert_eq!(parse(b"\x1b"), (vec![Key::Esc], 1));
+    }
 
     #[test]
     fn sgr_mouse_events() {
